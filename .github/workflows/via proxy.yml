@@ -1,4 +1,4 @@
-name: Direct MX Mail from URL
+name: Direct MX via Proxy
 
 on:
   workflow_dispatch:
@@ -31,11 +31,16 @@ jobs:
           nohup cloudflared access tcp \
             --hostname clash.pusytroller.gq \
             --url 127.0.0.1:8082 \
+            --no-autoupdate \
             > cf.log 2>&1 &
-          
+
+          echo "Waiting tunnel start..."
           sleep 5
+
           echo "Tunnel started"
-          sudo netstat -tlnp
+          sudo netstat -tlnp || true
+          echo "---- cloudflared log ----"
+          head -n 20 cf.log || true
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -51,7 +56,6 @@ jobs:
         env:
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
           DKIM_SELECTOR: ${{ secrets.DKIM_SELECTOR }}
-          DKIM_DOMAIN: ${{ secrets.DKIM_DOMAIN }}
           DKIM_PRIVATE_KEY: ${{ secrets.DKIM_PRIVATE_KEY }}
         run: |
           python - << 'EOF'
@@ -64,7 +68,7 @@ jobs:
           import socket
           from email import message_from_bytes
 
-          # ===== 使用 SOCKS 代理 =====
+          # ===== SOCKS5 代理 =====
           socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 8082)
           socket.socket = socks.socksocket
 
@@ -73,8 +77,13 @@ jobs:
 
           from_email = os.environ['FROM_EMAIL']
           DKIM_SELECTOR = os.environ['DKIM_SELECTOR']
-          DKIM_DOMAIN = os.environ['DKIM_DOMAIN']
           DKIM_PRIVATE_KEY = os.environ['DKIM_PRIVATE_KEY'].encode()
+
+          # ===== 自动推导 DKIM DOMAIN =====
+          DKIM_DOMAIN = from_email.rsplit('@', 1)[-1]
+
+          print("FROM:", from_email)
+          print("DKIM DOMAIN:", DKIM_DOMAIN)
 
           print(f"下载邮件内容: {eml_url}")
           resp = requests.get(eml_url, timeout=30)
