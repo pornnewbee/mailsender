@@ -1,14 +1,14 @@
-name: Direct MX via Proxy
+name: Direct MX Mail via Proxy
 
 on:
   workflow_dispatch:
     inputs:
       to_email:
         description: '收件人邮箱'
-        required: true
+        required: false
       eml_url:
         description: '邮件 .eml 文件 URL'
-        required: true
+        required: false
 
 jobs:
   send_email:
@@ -31,7 +31,6 @@ jobs:
           nohup cloudflared access tcp \
             --hostname clash.pusytroller.gq \
             --url 127.0.0.1:8082 \
-            --no-autoupdate \
             > cf.log 2>&1 &
 
           echo "Waiting tunnel start..."
@@ -61,45 +60,61 @@ jobs:
           python - << 'EOF'
           import os
           import smtplib
-          import dns.resolver
+          import dns.message
+          import dns.query
+          import dns.rdatatype
+          import dns.exception
           import requests
           import dkim
           import socks
           import socket
-          from email import message_from_bytes
-
+          import email
+          import email.utils
+          from email import message_from_bytes, policy
+      
           # ===== SOCKS5 代理 =====
-          socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 8082)
+          SOCKS_HOST = "127.0.0.1"
+          SOCKS_PORT = 8082
+          socks.set_default_proxy(socks.SOCKS5, SOCKS_HOST, SOCKS_PORT)
           socket.socket = socks.socksocket
-
+      
+          # ===== 输入处理 =====
           to_email = '${{ github.event.inputs.to_email }}'
           eml_url = '${{ github.event.inputs.eml_url }}'
-
+          if not to_email.strip():
+              to_email = 'kwangya@star-co.net.kp'
+          if not eml_url.strip():
+              eml_url = 'https://raw.githubusercontent.com/porndreamer/mail/refs/heads/main/Fucking%20%EA%B9%80%EC%A0%95%EC%9D%80.eml'
+      
           from_email = os.environ['FROM_EMAIL']
           DKIM_SELECTOR = os.environ['DKIM_SELECTOR']
           DKIM_PRIVATE_KEY = os.environ['DKIM_PRIVATE_KEY'].encode()
-
-          # ===== 自动推导 DKIM DOMAIN =====
           DKIM_DOMAIN = from_email.rsplit('@', 1)[-1]
-
+      
           print("FROM:", from_email)
           print("DKIM DOMAIN:", DKIM_DOMAIN)
-
+          print("TO:", to_email)
           print(f"下载邮件内容: {eml_url}")
+      
+          # ===== 下载 .eml 并重构邮件 =====
           resp = requests.get(eml_url, timeout=30)
           resp.raise_for_status()
-          eml_bytes = resp.content
-
-          msg = message_from_bytes(eml_bytes)
-
-          if 'From' not in msg:
-              msg['From'] = from_email
-          if 'To' not in msg:
-              msg['To'] = to_email
-          if 'Subject' not in msg:
-              msg['Subject'] = "No Subject"
-
-          headers = [b"From", b"To", b"Subject"]
+          orig_msg = message_from_bytes(resp.content, policy=policy.SMTP)
+      
+          msg = email.message.EmailMessage(policy=policy.SMTP)
+          msg['Subject'] = orig_msg.get('Subject', "No Subject")
+          msg['From'] = from_email
+          msg['To'] = to_email
+          msg['Date'] = email.utils.formatdate(localtime=True)
+          msg['Message-ID'] = email.utils.make_msgid(domain=DKIM_DOMAIN)
+      
+          if orig_msg.is_multipart():
+              msg.set_content(orig_msg.get_body(preferencelist=('plain', 'html')).get_content())
+          else:
+              msg.set_content(orig_msg.get_content())
+      
+          # ===== DKIM 签名 =====
+          headers = [b"From", b"To", b"Subject", b"Date", b"Message-ID"]
           sig = dkim.sign(
               message=msg.as_bytes(),
               selector=DKIM_SELECTOR.encode(),
@@ -108,26 +123,56 @@ jobs:
               include_headers=headers
           )
           msg_bytes = sig + msg.as_bytes()
-
+      
+          # ===== 查询 MX =====
+          def query_mx(domain):
+              try:
+                  q = dns.message.make_query(domain, dns.rdatatype.MX)
+                  response = dns.query.tcp(q, "1.1.1.1", port=53, timeout=10)
+                  mx_records = []
+                  for ans in response.answer:
+                      if ans.rdtype == dns.rdatatype.MX:
+                          for item in ans.items:
+                              mx_records.append((item.preference, str(item.exchange).rstrip('.')))
+                  return sorted(mx_records)
+              except dns.exception.DNSException as e:
+                  print("MX 查询失败:", e)
+                  return []
+      
           recipient_domain = to_email.split('@')[1]
-          answers = dns.resolver.resolve(recipient_domain, 'MX')
-          mx_hosts = sorted([(r.preference, r.exchange.to_text()) for r in answers])
-          mx_host = mx_hosts[0][1].rstrip('.')
-
+          mx_hosts = query_mx(recipient_domain)
+          if not mx_hosts:
+              raise Exception(f"无法解析 MX: {recipient_domain}")
+      
+          mx_host = mx_hosts[0][1]
           print(f"直连 MX: {mx_host}")
-
+      
+          # ===== 发送邮件（详细日志） =====
           try:
               with smtplib.SMTP(mx_host, 25, timeout=20) as server:
+                  server.set_debuglevel(1)  # 打印完整 SMTP 交互
+      
+                  # EHLO
+                  ehlo_resp = server.ehlo()
+                  print("EHLO response:", ehlo_resp)
+      
+                  # STARTTLS
                   try:
-                      server.starttls()
+                      starttls_resp = server.starttls()
+                      print("STARTTLS response:", starttls_resp)
                       print("STARTTLS 已启用")
-                  except Exception:
-                      print("对方不支持 STARTTLS")
-
-                  server.sendmail(from_email, [to_email], msg_bytes)
-
+                  except Exception as e:
+                      print("对方不支持 STARTTLS:", e)
+      
+                  # 再次 EHLO (推荐)
+                  ehlo2_resp = server.ehlo()
+                  print("EHLO 2nd response:", ehlo2_resp)
+      
+                  # 发送邮件
+                  send_resp = server.sendmail(from_email, [to_email], msg_bytes)
+                  print("sendmail response:", send_resp)
+      
               print(f"邮件已发送到 {to_email}")
-
           except Exception as e:
               print(f"发送失败: {e}")
           EOF
