@@ -1,0 +1,124 @@
+name: Direct MX Mail from URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      to_email:
+        description: '收件人邮箱'
+        required: true
+      eml_url:
+        description: '邮件 .eml 文件 URL'
+        required: true
+
+jobs:
+  send_email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # 安装 cloudflared
+      - name: Install cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+
+      # 建立 TCP 映射
+      - name: Start Cloudflare TCP Tunnel
+        run: |
+          nohup cloudflared access tcp \
+            --hostname clash.pusytroller.gq \
+            --url 127.0.0.1:8082 \
+            > cf.log 2>&1 &
+          
+          sleep 5
+          echo "Tunnel started"
+          sudo netstat -tlnp
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install dnspython dkimpy requests PySocks
+
+      - name: Send email via Clash Proxy
+        env:
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          DKIM_SELECTOR: ${{ secrets.DKIM_SELECTOR }}
+          DKIM_DOMAIN: ${{ secrets.DKIM_DOMAIN }}
+          DKIM_PRIVATE_KEY: ${{ secrets.DKIM_PRIVATE_KEY }}
+        run: |
+          python - << 'EOF'
+          import os
+          import smtplib
+          import dns.resolver
+          import requests
+          import dkim
+          import socks
+          import socket
+          from email import message_from_bytes
+
+          # ===== 使用 SOCKS 代理 =====
+          socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 8082)
+          socket.socket = socks.socksocket
+
+          to_email = '${{ github.event.inputs.to_email }}'
+          eml_url = '${{ github.event.inputs.eml_url }}'
+
+          from_email = os.environ['FROM_EMAIL']
+          DKIM_SELECTOR = os.environ['DKIM_SELECTOR']
+          DKIM_DOMAIN = os.environ['DKIM_DOMAIN']
+          DKIM_PRIVATE_KEY = os.environ['DKIM_PRIVATE_KEY'].encode()
+
+          print(f"下载邮件内容: {eml_url}")
+          resp = requests.get(eml_url, timeout=30)
+          resp.raise_for_status()
+          eml_bytes = resp.content
+
+          msg = message_from_bytes(eml_bytes)
+
+          if 'From' not in msg:
+              msg['From'] = from_email
+          if 'To' not in msg:
+              msg['To'] = to_email
+          if 'Subject' not in msg:
+              msg['Subject'] = "No Subject"
+
+          headers = [b"From", b"To", b"Subject"]
+          sig = dkim.sign(
+              message=msg.as_bytes(),
+              selector=DKIM_SELECTOR.encode(),
+              domain=DKIM_DOMAIN.encode(),
+              privkey=DKIM_PRIVATE_KEY,
+              include_headers=headers
+          )
+          msg_bytes = sig + msg.as_bytes()
+
+          recipient_domain = to_email.split('@')[1]
+          answers = dns.resolver.resolve(recipient_domain, 'MX')
+          mx_hosts = sorted([(r.preference, r.exchange.to_text()) for r in answers])
+          mx_host = mx_hosts[0][1].rstrip('.')
+
+          print(f"直连 MX: {mx_host}")
+
+          try:
+              with smtplib.SMTP(mx_host, 25, timeout=20) as server:
+                  try:
+                      server.starttls()
+                      print("STARTTLS 已启用")
+                  except Exception:
+                      print("对方不支持 STARTTLS")
+
+                  server.sendmail(from_email, [to_email], msg_bytes)
+
+              print(f"邮件已发送到 {to_email}")
+
+          except Exception as e:
+              print(f"发送失败: {e}")
+          EOF
