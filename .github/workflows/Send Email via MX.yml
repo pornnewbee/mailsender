@@ -1,16 +1,16 @@
-name: Send Email via MX (Custom Domain)
+name: Direct MX Mail Sender
 
 on:
   workflow_dispatch:
     inputs:
       to_email:
-        description: 'Recipient email'
+        description: '收件人邮箱'
         required: true
       subject:
-        description: 'Email subject'
+        description: '邮件主题'
         required: true
       body:
-        description: 'Email body'
+        description: '邮件内容'
         required: true
 
 jobs:
@@ -30,13 +30,12 @@ jobs:
           pip install --upgrade pip
           pip install dnspython dkimpy
 
-      - name: Send email
+      - name: Send email directly to MX
         env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}      # 你的邮箱，例如 mail@yourdomain.com
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}      # SMTP 密码
-          DKIM_SELECTOR: ${{ secrets.DKIM_SELECTOR }}  # DKIM selector
-          DKIM_DOMAIN: ${{ secrets.DKIM_DOMAIN }}      # 你的域名
-          DKIM_PRIVATE_KEY: ${{ secrets.DKIM_PRIVATE_KEY }} # DKIM 私钥
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}          # 你的域名邮箱
+          DKIM_SELECTOR: ${{ secrets.DKIM_SELECTOR }}    # DKIM selector
+          DKIM_DOMAIN: ${{ secrets.DKIM_DOMAIN }}        # 域名
+          DKIM_PRIVATE_KEY: ${{ secrets.DKIM_PRIVATE_KEY }} # DKIM 私钥内容
         run: |
           python - << 'EOF'
           import os
@@ -45,27 +44,26 @@ jobs:
           from email.message import EmailMessage
           import dkim
 
-          # 获取输入
+          # 输入参数
           to_email = '${{ github.event.inputs.to_email }}'
           subject = '${{ github.event.inputs.subject }}'
           body = '${{ github.event.inputs.body }}'
 
-          SMTP_USER = os.environ['SMTP_USER']
-          SMTP_PASS = os.environ['SMTP_PASS']
+          from_email = os.environ['FROM_EMAIL']
           DKIM_SELECTOR = os.environ['DKIM_SELECTOR']
           DKIM_DOMAIN = os.environ['DKIM_DOMAIN']
           DKIM_PRIVATE_KEY = os.environ['DKIM_PRIVATE_KEY'].encode()
 
-          # 获取收件人 MX
-          recipient_domain = to_email.split('@')[1]
-          answers = dns.resolver.resolve(recipient_domain, 'MX')
+          # 查询收件人 MX
+          domain = to_email.split('@')[1]
+          answers = dns.resolver.resolve(domain, 'MX')
           mx_hosts = sorted([(r.preference, r.exchange.to_text()) for r in answers])
-          mx_host = mx_hosts[0][1].rstrip('.')  # 优先级最高的 MX
-          print(f"Using MX {mx_host} for domain {recipient_domain}")
+          mx_host = mx_hosts[0][1].rstrip('.')
+          print(f"直连 MX: {mx_host}")
 
           # 创建邮件
           msg = EmailMessage()
-          msg['From'] = SMTP_USER
+          msg['From'] = from_email
           msg['To'] = to_email
           msg['Subject'] = subject
           msg.set_content(body)
@@ -81,11 +79,16 @@ jobs:
           )
           msg_bytes = sig + msg.as_bytes()
 
-          # 发送邮件（STARTTLS）
-          with smtplib.SMTP(mx_host, 25) as server:
-              server.starttls()
-              server.login(SMTP_USER, SMTP_PASS)
-              server.sendmail(SMTP_USER, [to_email], msg_bytes)
-
-          print(f"Email successfully sent to {to_email}")
+          # 发送邮件
+          try:
+              with smtplib.SMTP(mx_host, 25, timeout=10) as server:
+                  try:
+                      server.starttls()
+                      print("STARTTLS 已启用")
+                  except Exception:
+                      print("对方 MX 不支持 STARTTLS")
+                  server.sendmail(from_email, [to_email], msg_bytes)
+              print(f"邮件已发送到 {to_email}")
+          except Exception as e:
+              print(f"发送失败: {e}")
           EOF
